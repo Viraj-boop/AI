@@ -7,6 +7,7 @@ import { Particles } from './components/ui/particles';
 import { ShinyButton } from './components/ui/shiny-button';
 import { LiquidGlass } from './components/ui/liquid-glass';
 import { AnimatedText } from './components/ui/animated-text';
+import { CyberGlobe } from './components/ui/cyber-globe';
 
 const workletCode = `
 class PCMProcessor extends AudioWorkletProcessor {
@@ -479,9 +480,13 @@ export default function App() {
           </div>
 
           {/* Orb */}
-          <div className="relative w-64 h-64 flex items-center justify-center mx-auto lg:mx-0">
+          <div className="relative w-full max-w-md h-80 sm:h-96 flex flex-col items-center justify-center mx-auto lg:mx-0">
+            <div className="absolute inset-0 z-0 pointer-events-auto opacity-70 [mask-image:radial-gradient(ellipse_at_center,black_40%,transparent_70%)]">
+              <CyberGlobe />
+            </div>
+            
             <motion.div
-              className="absolute inset-0 rounded-full bg-emerald-500/20 blur-3xl"
+              className="absolute z-10 rounded-full bg-emerald-500/20 blur-3xl w-64 h-64"
               animate={{
                 scale: isSpeaking ? [1, 1.2, 1] : isConnected ? [1, 1.05, 1] : 1,
                 opacity: isSpeaking ? 0.8 : isConnected ? 0.4 : 0.1,
