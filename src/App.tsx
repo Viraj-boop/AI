@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { useEffect, useRef, useState } from 'react';
+import type { LiveServerMessage, Session } from '@google/genai';
 import { Mic, Phone, PhoneOff, Loader2, Volume2, Sparkles, Code, TrendingUp, Globe, Mail, ArrowRight, Languages } from 'lucide-react';
 import { motion } from 'motion/react';
 
@@ -23,10 +23,21 @@ class PCMProcessor extends AudioWorkletProcessor {
 registerProcessor('pcm-processor', PCMProcessor);
 `;
 
+const GEMINI_API_KEY =
+  import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.GEMINI_API_KEY;
+const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
 class PCMRecorder {
   context: AudioContext | null = null;
   stream: MediaStream | null = null;
+  sourceNode: MediaStreamAudioSourceNode | null = null;
   workletNode: AudioWorkletNode | null = null;
+  silentGainNode: GainNode | null = null;
+  workletUrl: string | null = null;
   onData: (base64: string) => void;
   
   constructor(onData: (base64: string) => void) {
@@ -34,18 +45,27 @@ class PCMRecorder {
   }
   
   async start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Microphone access is not supported in this browser.');
+    }
+
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: {
         channelCount: 1,
         sampleRate: 16000,
     } });
     this.context = new AudioContext({ sampleRate: 16000 });
+    if (this.context.state === 'suspended') {
+      await this.context.resume();
+    }
     
     const blob = new Blob([workletCode], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
-    await this.context.audioWorklet.addModule(url);
+    this.workletUrl = URL.createObjectURL(blob);
+    await this.context.audioWorklet.addModule(this.workletUrl);
     
-    const source = this.context.createMediaStreamSource(this.stream);
+    this.sourceNode = this.context.createMediaStreamSource(this.stream);
     this.workletNode = new AudioWorkletNode(this.context, 'pcm-processor');
+    this.silentGainNode = this.context.createGain();
+    this.silentGainNode.gain.value = 0;
     
     this.workletNode.port.onmessage = (e) => {
         const buffer = e.data;
@@ -57,19 +77,30 @@ class PCMRecorder {
         this.onData(btoa(binary));
     };
     
-    source.connect(this.workletNode);
+    this.sourceNode.connect(this.workletNode);
+    this.workletNode.connect(this.silentGainNode);
+    this.silentGainNode.connect(this.context.destination);
   }
   
   stop() {
-    if (this.workletNode) {
-        this.workletNode.disconnect();
+    this.sourceNode?.disconnect();
+    this.workletNode?.disconnect();
+    this.silentGainNode?.disconnect();
+    this.workletNode?.port.close();
+    this.stream?.getTracks().forEach((track) => track.stop());
+    if (this.context && this.context.state !== 'closed') {
+      void this.context.close();
     }
-    if (this.stream) {
-        this.stream.getTracks().forEach(t => t.stop());
+    if (this.workletUrl) {
+      URL.revokeObjectURL(this.workletUrl);
     }
-    if (this.context) {
-        this.context.close();
-    }
+
+    this.context = null;
+    this.stream = null;
+    this.sourceNode = null;
+    this.workletNode = null;
+    this.silentGainNode = null;
+    this.workletUrl = null;
   }
 }
 
@@ -79,15 +110,18 @@ class PCMPlayer {
   sources: AudioBufferSourceNode[] = [];
   onPlayingChange?: (isPlaying: boolean) => void;
   
-  init() {
+  async init() {
     if (!this.context) {
       this.context = new AudioContext({ sampleRate: 24000 });
-      this.nextTime = this.context.currentTime;
     }
+    if (this.context.state === 'suspended') {
+      await this.context.resume();
+    }
+    this.nextTime = this.context.currentTime;
   }
   
   play(base64Data: string) {
-    if (!this.context) return;
+    if (!this.context || this.context.state === 'closed') return;
     
     const binaryString = atob(base64Data);
     const len = binaryString.length;
@@ -121,6 +155,7 @@ class PCMPlayer {
       this.onPlayingChange(true);
     }
     source.onended = () => {
+      source.disconnect();
       this.sources = this.sources.filter(s => s !== source);
       if (this.sources.length === 0 && this.onPlayingChange) {
         this.onPlayingChange(false);
@@ -130,20 +165,22 @@ class PCMPlayer {
   
   stop() {
     this.sources.forEach(s => {
-      try { s.stop(); } catch (e) {}
+      try { s.stop(); } catch {}
+      s.disconnect();
     });
     this.sources = [];
-    if (this.context) {
-      this.context.close();
-      this.context = null;
+    if (this.context && this.context.state !== 'closed') {
+      void this.context.close();
     }
+    this.context = null;
     this.nextTime = 0;
     if (this.onPlayingChange) this.onPlayingChange(false);
   }
   
   interrupt() {
     this.sources.forEach(s => {
-      try { s.stop(); } catch (e) {}
+      try { s.stop(); } catch {}
+      s.disconnect();
     });
     this.sources = [];
     if (this.context) {
@@ -163,52 +200,115 @@ export default function App() {
   const [language, setLanguage] = useState('Auto-detect');
   
   const isConnectedRef = useRef(false);
-  const sessionRef = useRef<any>(null);
+  const sessionRef = useRef<Session | null>(null);
   const playerRef = useRef<PCMPlayer | null>(null);
   const recorderRef = useRef<PCMRecorder | null>(null);
+  const connectionAttemptRef = useRef(0);
+  const hasApiKey = Boolean(GEMINI_API_KEY);
+  const isConversationDisabled = isConnecting || (!hasApiKey && !isConnected);
 
   const setConnected = (val: boolean) => {
     setIsConnected(val);
     isConnectedRef.current = val;
   };
 
+  const stopActiveSession = (closeSession = true) => {
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    if (closeSession && session) {
+      try { session.close(); } catch {}
+    }
+
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+
+    playerRef.current?.stop();
+    playerRef.current = null;
+  };
+
+  const disconnect = ({ closeSession = true }: { closeSession?: boolean } = {}) => {
+    connectionAttemptRef.current += 1;
+    setConnected(false);
+    setIsConnecting(false);
+    setIsListening(false);
+    setIsSpeaking(false);
+    stopActiveSession(closeSession);
+  };
+
   const connect = async () => {
+    if (isConnecting || isConnectedRef.current) {
+      return;
+    }
+
+    if (!hasApiKey) {
+      setError('Add GEMINI_API_KEY or VITE_GEMINI_API_KEY to .env before starting a conversation.');
+      return;
+    }
+
+    const attemptId = connectionAttemptRef.current + 1;
+    connectionAttemptRef.current = attemptId;
     setIsConnecting(true);
+    setIsListening(false);
+    setIsSpeaking(false);
     setError(null);
     
     try {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        throw new Error("GEMINI_API_KEY is missing.");
+      stopActiveSession();
+
+      const { GoogleGenAI, Modality } = await import('@google/genai');
+      const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+      if (attemptId !== connectionAttemptRef.current) {
+        return;
       }
-      
-      const ai = new GoogleGenAI({ apiKey });
       
       playerRef.current = new PCMPlayer();
       playerRef.current.onPlayingChange = setIsSpeaking;
-      playerRef.current.init();
+      await playerRef.current.init();
       
-      const sessionPromise = ai.live.connect({
-        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+      let sessionPromise: Promise<Session>;
+      sessionPromise = ai.live.connect({
+        model: LIVE_MODEL,
         callbacks: {
           onopen: () => {
+            if (attemptId !== connectionAttemptRef.current) {
+              return;
+            }
+
             setConnected(true);
             setIsConnecting(false);
             
             recorderRef.current = new PCMRecorder((base64) => {
-              sessionPromise.then(session => {
+              void sessionPromise.then((session) => {
+                if (attemptId !== connectionAttemptRef.current) {
+                  return;
+                }
+
                 session.sendRealtimeInput({
                   media: { data: base64, mimeType: 'audio/pcm;rate=16000' }
                 });
               });
             });
-            recorderRef.current.start().then(() => setIsListening(true)).catch(e => {
-              console.error("Mic error", e);
-              setError("Could not access microphone.");
-              disconnect();
-            });
+            void recorderRef.current.start()
+              .then(() => {
+                if (attemptId === connectionAttemptRef.current) {
+                  setIsListening(true);
+                }
+              })
+              .catch((recorderError: unknown) => {
+                console.error("Mic error", recorderError);
+                if (attemptId !== connectionAttemptRef.current) {
+                  return;
+                }
+
+                setError("Could not access microphone.");
+                disconnect();
+              });
           },
-          onmessage: async (message: LiveServerMessage) => {
+          onmessage: (message: LiveServerMessage) => {
+            if (attemptId !== connectionAttemptRef.current) {
+              return;
+            }
+
             const parts = message.serverContent?.modelTurn?.parts;
             if (parts) {
               for (const part of parts) {
@@ -223,12 +323,20 @@ export default function App() {
           },
           onerror: (err) => {
             console.error("Live API Error:", err);
-            setError("Connection error occurred.");
-            disconnect();
+            if (attemptId !== connectionAttemptRef.current) {
+              return;
+            }
+
+            setError(err.message || "Connection error occurred.");
+            disconnect({ closeSession: false });
           },
           onclose: () => {
             console.log("Live API Closed");
-            disconnect();
+            if (attemptId !== connectionAttemptRef.current) {
+              return;
+            }
+
+            disconnect({ closeSession: false });
           }
         },
         config: {
@@ -240,45 +348,52 @@ export default function App() {
         },
       });
       
-      sessionRef.current = await sessionPromise;
-      if (!isConnectedRef.current) {
-        try { sessionRef.current.close(); } catch (e) {}
-        sessionRef.current = null;
+      const session = await sessionPromise;
+      if (attemptId !== connectionAttemptRef.current || !isConnectedRef.current) {
+        try { session.close(); } catch {}
+        return;
       }
+      sessionRef.current = session;
       
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to connect:", err);
-      setError(err.message || "Failed to connect to the AI receptionist.");
-      setIsConnecting(false);
-      setConnected(false);
-    }
-  };
+      if (attemptId !== connectionAttemptRef.current) {
+        return;
+      }
 
-  const disconnect = () => {
-    setConnected(false);
-    setIsConnecting(false);
-    setIsListening(false);
-    setIsSpeaking(false);
-    
-    if (sessionRef.current) {
-      try { sessionRef.current.close(); } catch (e) {}
-      sessionRef.current = null;
-    }
-    if (recorderRef.current) {
-      recorderRef.current.stop();
-      recorderRef.current = null;
-    }
-    if (playerRef.current) {
-      playerRef.current.stop();
-      playerRef.current = null;
+      setError(getErrorMessage(err, "Failed to connect to the AI receptionist."));
+      disconnect({ closeSession: false });
     }
   };
 
   useEffect(() => {
     return () => {
-      disconnect();
+      stopActiveSession();
     };
   }, []);
+
+  const handleConversationToggle = () => {
+    if (isConversationDisabled) {
+      return;
+    }
+
+    if (isConnected) {
+      disconnect();
+      return;
+    }
+
+    void connect();
+  };
+
+  const conversationStatusText = !hasApiKey
+    ? 'Add GEMINI_API_KEY or VITE_GEMINI_API_KEY to .env to enable voice chat.'
+    : isConnected
+      ? isSpeaking
+        ? 'Aethon is speaking right now.'
+        : isListening
+          ? 'Listening live. Speak naturally.'
+          : 'Connecting the audio session...'
+      : 'Click to start a voice conversation with the AI receptionist.';
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30">
@@ -344,8 +459,10 @@ export default function App() {
               }}
             />
             <motion.div
-              className="relative w-32 h-32 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 shadow-2xl flex items-center justify-center cursor-pointer"
-              onClick={isConnected ? disconnect : connect}
+              className={`relative w-32 h-32 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 shadow-2xl flex items-center justify-center ${
+                isConversationDisabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+              }`}
+              onClick={handleConversationToggle}
               animate={{
                 scale: isSpeaking ? [1, 1.1, 1] : 1,
               }}
@@ -376,8 +493,8 @@ export default function App() {
                 </div>
               )}
               <button
-                onClick={isConnected ? disconnect : connect}
-                disabled={isConnecting}
+                onClick={handleConversationToggle}
+                disabled={isConversationDisabled}
                 className={`
                   w-full py-4 rounded-2xl font-medium text-lg transition-all flex items-center justify-center gap-2
                   ${isConnected 
@@ -395,9 +512,7 @@ export default function App() {
                 )}
               </button>
               <p className="text-zinc-500 text-xs text-center lg:text-left w-full">
-                {isConnected 
-                  ? "Speak naturally. The AI will respond in real-time." 
-                  : "Click to start a voice conversation with the AI receptionist."}
+                {conversationStatusText}
               </p>
             </div>
 
