@@ -1,21 +1,35 @@
+// c:\Users\viraj\nexus-ai-receptionist\src\App.tsx
 import { useEffect, useRef, useState } from 'react';
 import type { LiveServerMessage, Session } from '@google/genai';
 import { Mic, Phone, PhoneOff, Loader2, Volume2, Sparkles, Code, TrendingUp, Globe, Mail, ArrowRight, Languages } from 'lucide-react';
 import { motion } from 'motion/react';
+import { Particles } from './components/ui/particles';
+import { ShinyButton } from './components/ui/shiny-button';
 
 const workletCode = `
 class PCMProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Int16Array(4096);
+    this.bufferSize = 0;
+  }
   process(inputs, outputs, parameters) {
     const input = inputs[0];
     if (input && input.length > 0) {
       const channelData = input[0];
-      const buffer = new ArrayBuffer(channelData.length * 2);
-      const view = new DataView(buffer);
       for (let i = 0; i < channelData.length; i++) {
         const s = Math.max(-1, Math.min(1, channelData[i]));
-        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        this.buffer[this.bufferSize++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        if (this.bufferSize >= 4096) {
+          const outBuffer = new ArrayBuffer(8192);
+          const view = new DataView(outBuffer);
+          for (let j = 0; j < 4096; j++) {
+            view.setInt16(j * 2, this.buffer[j], true);
+          }
+          this.port.postMessage(outBuffer, [outBuffer]);
+          this.bufferSize = 0;
+        }
       }
-      this.port.postMessage(buffer, [buffer]);
     }
     return true;
   }
@@ -25,7 +39,7 @@ registerProcessor('pcm-processor', PCMProcessor);
 
 const GEMINI_API_KEY =
   import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.GEMINI_API_KEY;
-const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-09-2025';
+const LIVE_MODEL = 'gemini-2.0-flash-exp';
 
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
@@ -49,11 +63,18 @@ class PCMRecorder {
       throw new Error('Microphone access is not supported in this browser.');
     }
 
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio: {
-        channelCount: 1,
-        sampleRate: 16000,
-    } });
-    this.context = new AudioContext({ sampleRate: 16000 });
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+      } });
+    } catch (e: any) {
+      throw new Error(`Microphone access denied or unavailable: ${e.message}`);
+    }
+
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    this.context = new AudioContextClass({ sampleRate: 16000 });
+    
     if (this.context.state === 'suspended') {
       await this.context.resume();
     }
@@ -62,6 +83,7 @@ class PCMRecorder {
     this.workletUrl = URL.createObjectURL(blob);
     await this.context.audioWorklet.addModule(this.workletUrl);
     
+    if (!this.stream) throw new Error("No media stream");
     this.sourceNode = this.context.createMediaStreamSource(this.stream);
     this.workletNode = new AudioWorkletNode(this.context, 'pcm-processor');
     this.silentGainNode = this.context.createGain();
@@ -283,9 +305,11 @@ export default function App() {
                   return;
                 }
 
-                session.sendRealtimeInput({
-                  media: { data: base64, mimeType: 'audio/pcm;rate=16000' }
-                });
+                try {
+                  session.sendRealtimeInput({
+                    media: { data: base64, mimeType: 'audio/pcm;rate=16000' }
+                  });
+                } catch(e) {}
               });
             });
             void recorderRef.current.start()
@@ -330,8 +354,8 @@ export default function App() {
             setError(err.message || "Connection error occurred.");
             disconnect({ closeSession: false });
           },
-          onclose: () => {
-            console.log("Live API Closed");
+          onclose: (e) => {
+            console.log("Live API Closed", e);
             if (attemptId !== connectionAttemptRef.current) {
               return;
             }
@@ -342,9 +366,9 @@ export default function App() {
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
           },
-          systemInstruction: `You are Aethon AI, an elite sales expert and receptionist for 'Aethon' (aethon.site), a premier Web Development and Digital Agency founded by Viraj. Core Services: High-end Web Development, Digital Marketing, SEO, and AI Automation. Contact info: Phone: 9730575099, Email: aethon.co@gmail.com. Your goal: Engage visitors, build immense value, handle objections (e.g., emphasize ROI and premium quality if they mention price), and convert them into paying customers. Call to Action: Encourage them to fill out the project inquiry form on the screen or call Viraj directly. Tone: Charismatic, confident, professional, and concise. Always drive the conversation towards a successful conversion.\n\nLANGUAGE INSTRUCTION: The user's preferred language is ${language}. ${language === 'Auto-detect' ? 'Detect the language the user speaks and respond naturally in that exact same language.' : 'You MUST speak, understand, and respond ONLY in ' + language + '.'}`,
+          systemInstruction: { parts: [{ text: `You are Aethon AI, an elite sales expert and receptionist for 'Aethon' (aethon.site), a premier Web Development and Digital Agency founded by Viraj. Core Services: High-end Web Development, Digital Marketing, SEO, and AI Automation. Contact info: Phone: 9730575099, Email: aethon.co@gmail.com. Your goal: Engage visitors, build immense value, handle objections (e.g., emphasize ROI and premium quality if they mention price), and convert them into paying customers. Call to Action: Encourage them to fill out the project inquiry form on the screen or call Viraj directly. Tone: Charismatic, confident, professional, and concise. Always drive the conversation towards a successful conversion.\n\nLANGUAGE INSTRUCTION: The user's preferred language is ${language}. ${language === 'Auto-detect' ? 'Detect the language the user speaks and respond naturally in that exact same language.' : 'You MUST speak, understand, and respond ONLY in ' + language + '.'}` }] },
         },
       });
       
@@ -396,7 +420,15 @@ export default function App() {
       : 'Click to start a voice conversation with the AI receptionist.';
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30 relative overflow-hidden">
+      <Particles
+        className="absolute inset-0 pointer-events-none z-0"
+        quantity={60}
+        ease={80}
+        color="#10b981"
+        refresh
+      />
+
       {/* Navbar */}
       <nav className="border-b border-zinc-800 bg-zinc-950/50 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
@@ -423,7 +455,7 @@ export default function App() {
               <option value="Mandarin">中文 (Mandarin)</option>
             </select>
           </div>
-          <a href="tel:9730575099" className="hidden sm:flex items-center gap-2 text-sm font-medium bg-zinc-900 hover:bg-zinc-800 px-4 py-2 rounded-full transition-colors border border-zinc-800">
+          <a href="tel:9730575099" className="hidden sm:flex items-center gap-2 text-sm font-medium bg-zinc-900 hover:bg-zinc-800 px-4 py-2 rounded-full transition-colors border border-zinc-800 z-10">
             <Phone className="w-4 h-4 text-emerald-400" />
             9730575099
           </a>
@@ -431,13 +463,13 @@ export default function App() {
         </div>
       </nav>
 
-      <main className="max-w-7xl mx-auto px-6 py-12 grid lg:grid-cols-2 gap-12 items-center">
+      <main className="max-w-7xl mx-auto px-6 py-12 grid lg:grid-cols-2 gap-12 items-center relative z-10">
         {/* Left: AI Interaction */}
         <div className="flex flex-col items-center lg:items-start gap-8">
           <div>
             <h1 className="text-4xl sm:text-5xl font-bold tracking-tight leading-tight mb-4 text-center lg:text-left">
               Your Digital Vision, <br/>
-              <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">Realized by Aethon.</span>
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 via-cyan-400 to-emerald-300 animate-pulse">Realized by Aethon.</span>
             </h1>
             <p className="text-zinc-400 text-lg text-center lg:text-left max-w-md">
               Speak with our AI Sales Expert to discover how our web development and digital marketing services can scale your business.
@@ -532,7 +564,7 @@ export default function App() {
         </div>
 
         {/* Right: Lead Form & Info */}
-        <div className="bg-zinc-900/50 border border-zinc-800 rounded-3xl p-8 backdrop-blur-sm shadow-2xl">
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-3xl p-8 backdrop-blur-sm shadow-2xl relative">
           <h2 className="text-2xl font-semibold mb-6">Start Your Project</h2>
           
           {formStatus === 'submitted' ? (
@@ -560,9 +592,9 @@ export default function App() {
                 <label className="text-xs font-medium text-zinc-400">Project Details</label>
                 <textarea required rows={3} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all resize-none" placeholder="Tell us about your goals..."></textarea>
               </div>
-              <button type="submit" className="w-full bg-emerald-500 text-zinc-950 hover:bg-emerald-400 font-medium py-3 rounded-xl flex items-center justify-center gap-2 transition-colors shadow-lg shadow-emerald-500/20">
-                Get a Proposal <ArrowRight className="w-4 h-4" />
-              </button>
+              <ShinyButton type="submit" className="w-full mt-2">
+                Get a Proposal <ArrowRight className="w-4 h-4 inline ml-2" />
+              </ShinyButton>
             </form>
           )}
 
