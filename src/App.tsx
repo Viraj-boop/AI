@@ -5,6 +5,8 @@ import { Mic, Phone, PhoneOff, Loader2, Volume2, Sparkles, Code, TrendingUp, Glo
 import { motion } from 'motion/react';
 import { Particles } from './components/ui/particles';
 import { ShinyButton } from './components/ui/shiny-button';
+import { LiquidGlass } from './components/ui/liquid-glass';
+import { AnimatedText } from './components/ui/animated-text';
 
 const workletCode = `
 class PCMProcessor extends AudioWorkletProcessor {
@@ -466,12 +468,12 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-12 grid lg:grid-cols-2 gap-12 items-center relative z-10">
         {/* Left: AI Interaction */}
         <div className="flex flex-col items-center lg:items-start gap-8">
-          <div>
-            <h1 className="text-4xl sm:text-5xl font-bold tracking-tight leading-tight mb-4 text-center lg:text-left">
-              Your Digital Vision, <br/>
-              <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 via-cyan-400 to-emerald-300 animate-pulse">Realized by Aethon.</span>
-            </h1>
-            <p className="text-zinc-400 text-lg text-center lg:text-left max-w-md">
+          <div className="flex flex-col gap-4 max-w-lg mx-auto lg:mx-0 text-center lg:text-left">
+            <AnimatedText
+              text="Your Digital Vision, Realized by Aethon."
+              className="text-4xl sm:text-5xl tracking-tight leading-tight justify-center lg:justify-start"
+            />
+            <p className="text-zinc-400 text-lg">
               Speak with our AI Sales Expert to discover how our web development and digital marketing services can scale your business.
             </p>
           </div>
@@ -564,7 +566,7 @@ export default function App() {
         </div>
 
         {/* Right: Lead Form & Info */}
-        <div className="bg-zinc-900/50 border border-zinc-800 rounded-3xl p-8 backdrop-blur-sm shadow-2xl relative">
+        <LiquidGlass>
           <h2 className="text-2xl font-semibold mb-6">Start Your Project</h2>
           
           {formStatus === 'submitted' ? (
@@ -610,7 +612,7 @@ export default function App() {
               <span className="text-xs text-zinc-500">9730575099</span>
             </a>
           </div>
-        </div>
+        </LiquidGlass>
       </main>
     </div>
   );
