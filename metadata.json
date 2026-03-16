@@ -1,0 +1,5 @@
+{
+  "name": "Nexus AI Receptionist",
+  "description": "A conversational AI receptionist using Gemini 2.5 Live API for real-time voice interaction.",
+  "requestFramePermissions": ["microphone"]
+}

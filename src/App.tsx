@@ -1,0 +1,470 @@
+import { useState, useEffect, useRef } from 'react';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { Mic, Phone, PhoneOff, Loader2, Volume2, Sparkles, Code, TrendingUp, Globe, Mail, ArrowRight, Languages } from 'lucide-react';
+import { motion } from 'motion/react';
+
+const workletCode = `
+class PCMProcessor extends AudioWorkletProcessor {
+  process(inputs, outputs, parameters) {
+    const input = inputs[0];
+    if (input && input.length > 0) {
+      const channelData = input[0];
+      const buffer = new ArrayBuffer(channelData.length * 2);
+      const view = new DataView(buffer);
+      for (let i = 0; i < channelData.length; i++) {
+        const s = Math.max(-1, Math.min(1, channelData[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      this.port.postMessage(buffer, [buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+class PCMRecorder {
+  context: AudioContext | null = null;
+  stream: MediaStream | null = null;
+  workletNode: AudioWorkletNode | null = null;
+  onData: (base64: string) => void;
+  
+  constructor(onData: (base64: string) => void) {
+    this.onData = onData;
+  }
+  
+  async start() {
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: {
+        channelCount: 1,
+        sampleRate: 16000,
+    } });
+    this.context = new AudioContext({ sampleRate: 16000 });
+    
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await this.context.audioWorklet.addModule(url);
+    
+    const source = this.context.createMediaStreamSource(this.stream);
+    this.workletNode = new AudioWorkletNode(this.context, 'pcm-processor');
+    
+    this.workletNode.port.onmessage = (e) => {
+        const buffer = e.data;
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        this.onData(btoa(binary));
+    };
+    
+    source.connect(this.workletNode);
+  }
+  
+  stop() {
+    if (this.workletNode) {
+        this.workletNode.disconnect();
+    }
+    if (this.stream) {
+        this.stream.getTracks().forEach(t => t.stop());
+    }
+    if (this.context) {
+        this.context.close();
+    }
+  }
+}
+
+class PCMPlayer {
+  context: AudioContext | null = null;
+  nextTime: number = 0;
+  sources: AudioBufferSourceNode[] = [];
+  onPlayingChange?: (isPlaying: boolean) => void;
+  
+  init() {
+    if (!this.context) {
+      this.context = new AudioContext({ sampleRate: 24000 });
+      this.nextTime = this.context.currentTime;
+    }
+  }
+  
+  play(base64Data: string) {
+    if (!this.context) return;
+    
+    const binaryString = atob(base64Data);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    const view = new DataView(bytes.buffer);
+    const float32Array = new Float32Array(bytes.length / 2);
+    for (let i = 0; i < float32Array.length; i++) {
+        float32Array[i] = view.getInt16(i * 2, true) / 32768.0;
+    }
+    
+    const buffer = this.context.createBuffer(1, float32Array.length, this.context.sampleRate);
+    buffer.getChannelData(0).set(float32Array);
+    
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.context.destination);
+    
+    if (this.nextTime < this.context.currentTime) {
+        this.nextTime = this.context.currentTime + 0.1;
+    }
+    
+    source.start(this.nextTime);
+    this.nextTime += buffer.duration;
+    
+    this.sources.push(source);
+    if (this.sources.length === 1 && this.onPlayingChange) {
+      this.onPlayingChange(true);
+    }
+    source.onended = () => {
+      this.sources = this.sources.filter(s => s !== source);
+      if (this.sources.length === 0 && this.onPlayingChange) {
+        this.onPlayingChange(false);
+      }
+    };
+  }
+  
+  stop() {
+    this.sources.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
+    this.sources = [];
+    if (this.context) {
+      this.context.close();
+      this.context = null;
+    }
+    this.nextTime = 0;
+    if (this.onPlayingChange) this.onPlayingChange(false);
+  }
+  
+  interrupt() {
+    this.sources.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
+    this.sources = [];
+    if (this.context) {
+      this.nextTime = this.context.currentTime;
+    }
+    if (this.onPlayingChange) this.onPlayingChange(false);
+  }
+}
+
+export default function App() {
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [formStatus, setFormStatus] = useState<'idle' | 'submitted'>('idle');
+  const [language, setLanguage] = useState('Auto-detect');
+  
+  const isConnectedRef = useRef(false);
+  const sessionRef = useRef<any>(null);
+  const playerRef = useRef<PCMPlayer | null>(null);
+  const recorderRef = useRef<PCMRecorder | null>(null);
+
+  const setConnected = (val: boolean) => {
+    setIsConnected(val);
+    isConnectedRef.current = val;
+  };
+
+  const connect = async () => {
+    setIsConnecting(true);
+    setError(null);
+    
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error("GEMINI_API_KEY is missing.");
+      }
+      
+      const ai = new GoogleGenAI({ apiKey });
+      
+      playerRef.current = new PCMPlayer();
+      playerRef.current.onPlayingChange = setIsSpeaking;
+      playerRef.current.init();
+      
+      const sessionPromise = ai.live.connect({
+        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        callbacks: {
+          onopen: () => {
+            setConnected(true);
+            setIsConnecting(false);
+            
+            recorderRef.current = new PCMRecorder((base64) => {
+              sessionPromise.then(session => {
+                session.sendRealtimeInput({
+                  media: { data: base64, mimeType: 'audio/pcm;rate=16000' }
+                });
+              });
+            });
+            recorderRef.current.start().then(() => setIsListening(true)).catch(e => {
+              console.error("Mic error", e);
+              setError("Could not access microphone.");
+              disconnect();
+            });
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            const parts = message.serverContent?.modelTurn?.parts;
+            if (parts) {
+              for (const part of parts) {
+                if (part.inlineData?.data && playerRef.current) {
+                  playerRef.current.play(part.inlineData.data);
+                }
+              }
+            }
+            if (message.serverContent?.interrupted && playerRef.current) {
+              playerRef.current.interrupt();
+            }
+          },
+          onerror: (err) => {
+            console.error("Live API Error:", err);
+            setError("Connection error occurred.");
+            disconnect();
+          },
+          onclose: () => {
+            console.log("Live API Closed");
+            disconnect();
+          }
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+          },
+          systemInstruction: `You are Aethon AI, an elite sales expert and receptionist for 'Aethon' (aethon.site), a premier Web Development and Digital Agency founded by Viraj. Core Services: High-end Web Development, Digital Marketing, SEO, and AI Automation. Contact info: Phone: 9730575099, Email: aethon.co@gmail.com. Your goal: Engage visitors, build immense value, handle objections (e.g., emphasize ROI and premium quality if they mention price), and convert them into paying customers. Call to Action: Encourage them to fill out the project inquiry form on the screen or call Viraj directly. Tone: Charismatic, confident, professional, and concise. Always drive the conversation towards a successful conversion.\n\nLANGUAGE INSTRUCTION: The user's preferred language is ${language}. ${language === 'Auto-detect' ? 'Detect the language the user speaks and respond naturally in that exact same language.' : 'You MUST speak, understand, and respond ONLY in ' + language + '.'}`,
+        },
+      });
+      
+      sessionRef.current = await sessionPromise;
+      if (!isConnectedRef.current) {
+        try { sessionRef.current.close(); } catch (e) {}
+        sessionRef.current = null;
+      }
+      
+    } catch (err: any) {
+      console.error("Failed to connect:", err);
+      setError(err.message || "Failed to connect to the AI receptionist.");
+      setIsConnecting(false);
+      setConnected(false);
+    }
+  };
+
+  const disconnect = () => {
+    setConnected(false);
+    setIsConnecting(false);
+    setIsListening(false);
+    setIsSpeaking(false);
+    
+    if (sessionRef.current) {
+      try { sessionRef.current.close(); } catch (e) {}
+      sessionRef.current = null;
+    }
+    if (recorderRef.current) {
+      recorderRef.current.stop();
+      recorderRef.current = null;
+    }
+    if (playerRef.current) {
+      playerRef.current.stop();
+      playerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      disconnect();
+    };
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30">
+      {/* Navbar */}
+      <nav className="border-b border-zinc-800 bg-zinc-950/50 backdrop-blur-md sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-6 h-6 text-emerald-400" />
+            <span className="text-xl font-bold tracking-tight">Aethon</span>
+          </div>
+        <div className="flex items-center gap-4">
+          <div className="hidden sm:flex items-center gap-2 bg-zinc-900 border border-zinc-800 rounded-full px-3 py-1.5">
+            <Languages className="w-4 h-4 text-zinc-400" />
+            <select 
+              value={language} 
+              onChange={(e) => setLanguage(e.target.value)}
+              disabled={isConnected || isConnecting}
+              className="bg-transparent text-sm text-zinc-300 focus:outline-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed [&>option]:bg-zinc-900"
+            >
+              <option value="Auto-detect">Auto-detect Language</option>
+              <option value="English">English</option>
+              <option value="Spanish">Español</option>
+              <option value="French">Français</option>
+              <option value="German">Deutsch</option>
+              <option value="Hindi">हिंदी (Hindi)</option>
+              <option value="Arabic">العربية (Arabic)</option>
+              <option value="Mandarin">中文 (Mandarin)</option>
+            </select>
+          </div>
+          <a href="tel:9730575099" className="hidden sm:flex items-center gap-2 text-sm font-medium bg-zinc-900 hover:bg-zinc-800 px-4 py-2 rounded-full transition-colors border border-zinc-800">
+            <Phone className="w-4 h-4 text-emerald-400" />
+            9730575099
+          </a>
+        </div>
+        </div>
+      </nav>
+
+      <main className="max-w-7xl mx-auto px-6 py-12 grid lg:grid-cols-2 gap-12 items-center">
+        {/* Left: AI Interaction */}
+        <div className="flex flex-col items-center lg:items-start gap-8">
+          <div>
+            <h1 className="text-4xl sm:text-5xl font-bold tracking-tight leading-tight mb-4 text-center lg:text-left">
+              Your Digital Vision, <br/>
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-cyan-400">Realized by Aethon.</span>
+            </h1>
+            <p className="text-zinc-400 text-lg text-center lg:text-left max-w-md">
+              Speak with our AI Sales Expert to discover how our web development and digital marketing services can scale your business.
+            </p>
+          </div>
+
+          {/* Orb */}
+          <div className="relative w-64 h-64 flex items-center justify-center mx-auto lg:mx-0">
+            <motion.div
+              className="absolute inset-0 rounded-full bg-emerald-500/20 blur-3xl"
+              animate={{
+                scale: isSpeaking ? [1, 1.2, 1] : isConnected ? [1, 1.05, 1] : 1,
+                opacity: isSpeaking ? 0.8 : isConnected ? 0.4 : 0.1,
+              }}
+              transition={{
+                duration: isSpeaking ? 1.5 : 3,
+                repeat: Infinity,
+                ease: "easeInOut"
+              }}
+            />
+            <motion.div
+              className="relative w-32 h-32 rounded-full bg-gradient-to-br from-emerald-400 to-emerald-600 shadow-2xl flex items-center justify-center cursor-pointer"
+              onClick={isConnected ? disconnect : connect}
+              animate={{
+                scale: isSpeaking ? [1, 1.1, 1] : 1,
+              }}
+              transition={{
+                duration: 0.5,
+                repeat: isSpeaking ? Infinity : 0,
+                ease: "easeInOut"
+              }}
+            >
+              {isConnecting ? (
+                <Loader2 className="w-10 h-10 text-white animate-spin" />
+              ) : isSpeaking ? (
+                <Volume2 className="w-10 h-10 text-white" />
+              ) : isConnected ? (
+                <Mic className="w-10 h-10 text-white" />
+              ) : (
+                <PhoneOff className="w-10 h-10 text-white/50" />
+              )}
+            </motion.div>
+          </div>
+
+          {/* Controls */}
+          <div className="w-full max-w-md space-y-6">
+            <div className="flex flex-col items-center lg:items-start gap-2">
+              {error && (
+                <div className="text-red-400 text-sm bg-red-400/10 px-4 py-2 rounded-lg text-center w-full mb-2">
+                  {error}
+                </div>
+              )}
+              <button
+                onClick={isConnected ? disconnect : connect}
+                disabled={isConnecting}
+                className={`
+                  w-full py-4 rounded-2xl font-medium text-lg transition-all flex items-center justify-center gap-2
+                  ${isConnected 
+                    ? 'bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/20' 
+                    : 'bg-emerald-500 text-zinc-950 hover:bg-emerald-400 shadow-[0_0_20px_rgba(16,185,129,0.3)]'}
+                  disabled:opacity-50 disabled:cursor-not-allowed
+                `}
+              >
+                {isConnecting ? (
+                  <><Loader2 className="w-5 h-5 animate-spin" /> Connecting...</>
+                ) : isConnected ? (
+                  <><PhoneOff className="w-5 h-5" /> End Call</>
+                ) : (
+                  <><Phone className="w-5 h-5" /> Start Conversation</>
+                )}
+              </button>
+              <p className="text-zinc-500 text-xs text-center lg:text-left w-full">
+                {isConnected 
+                  ? "Speak naturally. The AI will respond in real-time." 
+                  : "Click to start a voice conversation with the AI receptionist."}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2 justify-center lg:justify-start pt-4 border-t border-zinc-800/50">
+              <span className="text-xs text-zinc-500 uppercase tracking-wider w-full text-center lg:text-left mb-1">Ask me about:</span>
+              <div className="flex items-center gap-2 text-xs font-medium bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-full text-zinc-300">
+                <Code className="w-3 h-3 text-emerald-400" /> Web Development
+              </div>
+              <div className="flex items-center gap-2 text-xs font-medium bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-full text-zinc-300">
+                <TrendingUp className="w-3 h-3 text-emerald-400" /> Digital Marketing
+              </div>
+              <div className="flex items-center gap-2 text-xs font-medium bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-full text-zinc-300">
+                <Globe className="w-3 h-3 text-emerald-400" /> SEO Optimization
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Right: Lead Form & Info */}
+        <div className="bg-zinc-900/50 border border-zinc-800 rounded-3xl p-8 backdrop-blur-sm shadow-2xl">
+          <h2 className="text-2xl font-semibold mb-6">Start Your Project</h2>
+          
+          {formStatus === 'submitted' ? (
+            <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-6 text-center space-y-4">
+              <div className="w-12 h-12 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto">
+                <Sparkles className="w-6 h-6 text-emerald-400" />
+              </div>
+              <h3 className="text-lg font-medium text-emerald-400">Request Received!</h3>
+              <p className="text-zinc-400 text-sm">Viraj will get back to you shortly to discuss your project.</p>
+              <button onClick={() => setFormStatus('idle')} className="text-sm text-zinc-300 hover:text-white underline mt-4">Submit another</button>
+            </div>
+          ) : (
+            <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); setFormStatus('submitted'); }}>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-zinc-400">Name</label>
+                  <input required type="text" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all" placeholder="John Doe" />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-zinc-400">Email</label>
+                  <input required type="email" className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all" placeholder="john@example.com" />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-zinc-400">Project Details</label>
+                <textarea required rows={3} className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 focus:ring-1 focus:ring-emerald-500/50 transition-all resize-none" placeholder="Tell us about your goals..."></textarea>
+              </div>
+              <button type="submit" className="w-full bg-emerald-500 text-zinc-950 hover:bg-emerald-400 font-medium py-3 rounded-xl flex items-center justify-center gap-2 transition-colors shadow-lg shadow-emerald-500/20">
+                Get a Proposal <ArrowRight className="w-4 h-4" />
+              </button>
+            </form>
+          )}
+
+          <div className="mt-8 pt-8 border-t border-zinc-800 grid grid-cols-2 gap-4">
+            <a href="mailto:aethon.co@gmail.com" className="flex flex-col gap-1 p-4 rounded-2xl bg-zinc-950/50 border border-zinc-800/50 hover:border-zinc-700 transition-colors group">
+              <Mail className="w-5 h-5 text-zinc-500 group-hover:text-emerald-400 transition-colors" />
+              <span className="text-xs font-medium text-zinc-300 mt-2">Email Us</span>
+              <span className="text-xs text-zinc-500 truncate">aethon.co@gmail.com</span>
+            </a>
+            <a href="tel:9730575099" className="flex flex-col gap-1 p-4 rounded-2xl bg-zinc-950/50 border border-zinc-800/50 hover:border-zinc-700 transition-colors group">
+              <Phone className="w-5 h-5 text-zinc-500 group-hover:text-emerald-400 transition-colors" />
+              <span className="text-xs font-medium text-zinc-300 mt-2">Call Viraj</span>
+              <span className="text-xs text-zinc-500">9730575099</span>
+            </a>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
